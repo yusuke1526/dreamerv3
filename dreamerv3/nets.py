@@ -88,9 +88,10 @@ class RSSM(nj.Module):
           self._action_clip, jnp.abs(prev_action)))
     prev_state, prev_action = jax.tree_util.tree_map(
         lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
+    initial_state = self.initial(len(is_first))
     prev_state = jax.tree_util.tree_map(
         lambda x, y: x + self._mask(y, is_first),
-        prev_state, self.initial(len(is_first)))
+        prev_state, initial_state)
     prior = self.img_step(prev_state, prev_action)
     x = jnp.concatenate([prior['deter'], embed], -1)
     x = self.get('obs_out', Linear, **self._kw)(x)

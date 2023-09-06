@@ -30,7 +30,7 @@ RUN pip3 install --upgrade pip
 # Envs
 ENV MUJOCO_GL egl
 ENV DMLAB_DATASET_PATH /dmlab_data
-COPY dreamerv3/embodied/scripts scripts
+COPY ./dreamerv3/embodied/scripts scripts
 RUN sh scripts/install-dmlab.sh
 RUN sh scripts/install-atari.sh
 RUN sh scripts/install-minecraft.sh
@@ -58,7 +58,7 @@ ENV GCS_WRITE_REQUEST_TIMEOUT_SECS=600
 
 # Embodied
 RUN pip3 install numpy cloudpickle ruamel.yaml rich zmq msgpack
-COPY . /embodied
+COPY .. /embodied
 RUN chown -R 1000:root /embodied && chmod -R 775 /embodied
 
 WORKDIR embodied
@@ -69,4 +69,4 @@ WORKDIR embodied
 # ENTRYPOINT ["/entrypoint.sh"]
 # CMD ["/bin/bash"]
 
-COPY dreamerv3/install.sh /scripts
+COPY ./dreamerv3/install.sh /scripts

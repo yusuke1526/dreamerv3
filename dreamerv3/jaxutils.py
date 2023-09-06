@@ -178,6 +178,11 @@ class DiscDist:
 
   def mode(self):
     return self.transbwd((self.probs * self.bins).sum(-1))
+  
+  def std(self):
+    mean_value = jnp.expand_dims(self.mean(), axis=-1)
+    variance = ((self.bins - mean_value) ** 2 * self.probs).sum(-1)
+    return self.transbwd(jnp.sqrt(variance))
 
   def log_prob(self, x):
     x = self.transfwd(x)

@@ -30,7 +30,7 @@ def main(argv=None):
   config = embodied.Flags(config).parse(other)
   args = embodied.Config(
       **config.run, logdir=config.logdir,
-      batch_steps=config.batch_size * config.batch_length)
+      batch_steps=config.batch_size * config.batch_length, task=config.task, env=config.env)
   print(config)
 
   logdir = embodied.Path(args.logdir)
@@ -49,6 +49,13 @@ def main(argv=None):
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
       embodied.run.train(agent, env, replay, logger, args)
 
+    elif args.script == 'pretrain':
+      replay = make_replay(config, config.replaydir)
+      env = make_envs(config)
+      cleanup.append(env)
+      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      embodied.run.train(agent, env, replay, logger, args)
+
     elif args.script == 'train_save':
       replay = make_replay(config, logdir / 'replay')
       env = make_envs(config)
@@ -60,7 +67,7 @@ def main(argv=None):
       replay = make_replay(config, logdir / 'replay')
       eval_replay = make_replay(config, logdir / 'eval_replay', is_eval=True)
       env = make_envs(config)
-      eval_env = make_envs(config)  # mode='eval'
+      eval_env = make_envs(config, mode='eval')  # mode='eval'
       cleanup += [env, eval_env]
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
       embodied.run.train_eval(
@@ -81,7 +88,7 @@ def main(argv=None):
           agent, env, replay, eval_replay, logger, args)
 
     elif args.script == 'eval_only':
-      env = make_envs(config)  # mode='eval'
+      env = make_envs(config, mode='eval')  # mode='eval'
       cleanup.append(env)
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
       embodied.run.eval_only(agent, env, logger, args)
@@ -107,14 +114,19 @@ def main(argv=None):
 
 def make_logger(parsed, logdir, step, config):
   multiplier = config.env.get(config.task.split('_')[0], {}).get('repeat', 1)
-  logger = embodied.Logger(step, [
-      embodied.logger.TerminalOutput(config.filter),
-      embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
-      embodied.logger.JSONLOutput(logdir, 'scores.jsonl', 'episode/score'),
-      embodied.logger.TensorBoardOutput(logdir),
-      # embodied.logger.WandBOutput(logdir.name, config),
-      # embodied.logger.MLFlowOutput(logdir.name),
-  ], multiplier)
+  outputs = [
+    embodied.logger.TerminalOutput(config.filter),
+    embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
+    embodied.logger.JSONLOutput(logdir, 'scores.jsonl', 'episode/score'),
+    # embodied.logger.TensorBoardOutput(logdir),
+    # embodied.logger.WandBOutput(logdir.name, config),
+    # embodied.logger.MLFlowOutput(logdir.name),
+  ]
+  if config.use_wandb:
+    outputs += [embodied.logger.WandBOutput(config.filter, logdir, config)]
+  else:
+    outputs += [embodied.logger.TensorBoardOutput(logdir)]
+  logger = embodied.Logger(step, outputs, multiplier)
   return logger
 
 
@@ -169,6 +181,7 @@ def make_env(config, **overrides):
       'minecraft': 'embodied.envs.minecraft:Minecraft',
       'loconav': 'embodied.envs.loconav:LocoNav',
       'pinpad': 'embodied.envs.pinpad:PinPad',
+      'carla': 'gym_carla.envs.carla_env:CarlaEnv',
   }[suite]
   if isinstance(ctor, str):
     module, cls = ctor.split(':')
@@ -176,7 +189,20 @@ def make_env(config, **overrides):
     ctor = getattr(module, cls)
   kwargs = config.env.get(suite, {})
   kwargs.update(overrides)
-  env = ctor(task, **kwargs)
+  print(overrides)
+  print(kwargs)
+  if suite in ["carla"]:
+    from embodied.envs import from_gym
+    if kwargs.get('mode', 'train') == 'eval':
+      kwargs.update({
+        'auto_exploration': False,
+        'port': kwargs['port_eval'],
+        })
+    env = ctor(kwargs)
+    env = from_gym.FromGym(env)
+    env = wrappers.ActionRepeat(env, config.env.carla.repeat)
+  else:
+    env = ctor(task, **kwargs)
   return wrap_env(env, config)
 
 

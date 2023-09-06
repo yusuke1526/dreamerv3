@@ -1,4 +1,5 @@
 import re
+import jax
 
 import embodied
 import numpy as np
@@ -6,7 +7,7 @@ import numpy as np
 from .plot import plot_action_on_video
 
 
-def train_eval(
+def train_on_dataset(
     agent, train_env, eval_env, train_replay, eval_replay, logger, args):
 
   logdir = embodied.Path(args.logdir)
@@ -115,6 +116,14 @@ def train_eval(
     checkpoint.load(args.from_checkpoint)
   checkpoint.load_or_save()
   should_save(step)  # Register that we jused saved.
+
+  if args.freeze_wm:
+    # fix wm weights
+    frozen_weights = agent.wm.params
+    # 重みを凍結する（トレーニング中に更新されないようにする）
+    frozen_weights = jax.tree_map(jax.lax.stop_gradient, frozen_weights)
+    # 凍結した重みをモデルに設定
+    agent.wm.dense1 = agent.wm.replace(params=frozen_weights)
 
   print('Start training loop.')
   if args.task.split('_')[0] == "carla" and args.env.carla.auto_exploration:

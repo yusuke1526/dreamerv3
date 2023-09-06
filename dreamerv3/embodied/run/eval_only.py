@@ -3,6 +3,8 @@ import re
 import embodied
 import numpy as np
 
+from .plot import plot_action_on_video
+
 
 def eval_only(agent, env, logger, args):
 
@@ -29,7 +31,7 @@ def eval_only(agent, env, logger, args):
     stats = {}
     for key in args.log_keys_video:
       if key in ep:
-        stats[f'policy_{key}'] = ep[key]
+        stats[f'policy_{key}'] = plot_action_on_video(ep[key], ep['action'])
     for key, value in ep.items():
       if not args.log_zeros and key not in nonzeros and (value == 0).all():
         continue

@@ -5,6 +5,10 @@ import ruamel.yaml as yaml
 tree_map = jax.tree_util.tree_map
 sg = lambda x: tree_map(jax.lax.stop_gradient, x)
 
+from tensorflow_probability.substrates import jax as tfp
+tfd = tfp.distributions
+
+
 import logging
 logger = logging.getLogger()
 class CheckTypesFilter(logging.Filter):
@@ -77,15 +81,31 @@ class Agent(nj.Module):
     self.config.jax.jit and print('Tracing train function.')
     metrics = {}
     data = self.preprocess(data)
+    # 世界モデルの学習
     state, wm_outs, mets = self.wm.train(data, state)
     metrics.update(mets)
     context = {**data, **wm_outs['post']}
+    context['embed'] = wm_outs['embed']
     start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
-    _, mets = self.task_behavior.train(self.wm.imagine, start, context)
+    aux_args = {'observe': self.wm.observe}
+    # actor-criticの学習
+    _, mets = self.task_behavior.train(self.wm.imagine, start, context, **aux_args)
     metrics.update(mets)
     if self.config.expl_behavior != 'None':
-      _, mets = self.expl_behavior.train(self.wm.imagine, start, context)
+      _, mets = self.expl_behavior.train(self.wm.imagine, start, context, **aux_args)
       metrics.update({'expl_' + key: value for key, value in mets.items()})
+    outs = {}
+    return outs, state, metrics
+  
+  def train_wm(self, data, state):
+    self.config.jax.jit and print('Tracing train function.')
+    metrics = {}
+    data = self.preprocess(data)
+    # 世界モデルの学習
+    state, wm_outs, mets = self.wm.train(data, state)
+    metrics.update(mets)
+    context = {**data, **wm_outs['post']}
+    context['embed'] = wm_outs['embed']
     outs = {}
     return outs, state, metrics
 
@@ -196,14 +216,22 @@ class WorldModel(nj.Module):
     discount = 1 - 1 / self.config.horizon
     traj['weight'] = jnp.cumprod(discount * traj['cont'], 0) / discount
     return traj
+  
+  def observe(self, embed, action, is_first, context, state=None):
+    post, _ = self.rssm.observe(embed, action, is_first, state)
+    obs_traj = {'action': action, **post}
+    obs_traj['cont'] = (1.0 - context['is_terminal']).astype(jnp.float32)
+    discount = 1 - 1 / self.config.horizon
+    obs_traj['weight'] = jnp.cumprod(discount * obs_traj['cont'], 0) / discount
+    return obs_traj
 
   def report(self, data):
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])
     context, _ = self.rssm.observe(
-        self.encoder(data)[:6, :5], data['action'][:6, :5],
-        data['is_first'][:6, :5])
+        self.encoder(data)[:6], data['action'][:6],
+        data['is_first'][:6])
     start = {k: v[:, -1] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     openl = self.heads['decoder'](
@@ -212,7 +240,7 @@ class WorldModel(nj.Module):
       truth = data[key][:6].astype(jnp.float32)
       model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
       error = (model - truth + 1) / 2
-      video = jnp.concatenate([truth, model, error], 2)
+      video = jnp.concatenate([truth, recon[key].mode(), model, error], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
     return report
 
@@ -255,6 +283,9 @@ class ImagActorCritic(nj.Module):
         k: jaxutils.Moments(**config.retnorm, name=f'retnorm_{k}')
         for k in critics}
     self.opt = jaxutils.Optimizer(name='actor_opt', **config.actor_opt)
+    self.enable_obs_actor_loss = config.enable_obs_actor_loss
+    self.enable_bc = config.enable_bc
+    self.enable_combo = config.enable_combo
 
   def initial(self, batch_size):
     return {}
@@ -262,16 +293,30 @@ class ImagActorCritic(nj.Module):
   def policy(self, state, carry):
     return {'action': self.actor(state)}, carry
 
-  def train(self, imagine, start, context):
+  def train(self, imagine, start, context, **kwargs):
+    # ポリシーの損失
     def loss(start):
       policy = lambda s: self.actor(sg(s)).sample(seed=nj.rng())
       traj = imagine(policy, start, self.config.imag_horizon)
       loss, metrics = self.loss(traj)
+      if self.enable_bc: # Behavior Cloning
+        state = {k: v for k, v in context.items() if k in ['deter', 'stoch']}
+        predicted_actions = policy(state)
+        mse = jnp.mean(jnp.square(predicted_actions - context['action']))
+        loss += self.config.loss_scales.bc * mse
+        metrics.update({f'behavior_cloning_mse': mse})
       return loss, (traj, metrics)
+    # ポリシーの更新
     mets, (traj, metrics) = self.opt(self.actor, loss, start, has_aux=True)
     metrics.update(mets)
+    # Q関数の更新
     for key, critic in self.critics.items():
-      mets = critic.train(traj, self.actor)
+      if self.enable_combo:
+        observe = kwargs.get('observe', None)
+        obs_traj = observe(context['embed'], context['action'], context['is_first'], context)
+        mets = critic.train((traj, obs_traj), self.actor)
+      else:
+        mets = critic.train(traj, self.actor)
       metrics.update({f'{key}_critic_{k}': v for k, v in mets.items()})
     return traj, metrics
 
@@ -328,32 +373,110 @@ class VFunction(nj.Module):
         self.config.slow_critic_fraction,
         self.config.slow_critic_update)
     self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
+    self.recursive_count = 0
+    self.recursive_mean = 0.0
 
   def train(self, traj, actor):
-    target = sg(self.score(traj)[1])
-    mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
+    if self.config.enable_combo:
+      assert isinstance(traj, tuple), f'the type of traj is invalid: {type(traj)}'
+      img_traj, obs_traj = traj
+      img_target = sg(self.score(img_traj)[1])
+      obs_target = sg(self.score(obs_traj)[1])
+      mets, metrics = self.opt(self.net, self.conservative_loss, img_traj, obs_traj, img_target, obs_target, has_aux=True)
+    else:
+      target = sg(self.score(traj)[1])
+      mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
     metrics.update(mets)
     self.updater()
     return metrics
-
+  
   def loss(self, traj, target):
     metrics = {}
     traj = {k: v[:-1] for k, v in traj.items()}
     dist = self.net(traj)
+    if self.config.enable_rew_std_gen:
+      dist_std = sg(dist.std())
+      print(f'dist_std.shape: {dist_std.shape}')
+      dist_std_mean = dist_std.mean(axis=-1, keepdims=True)
+      # target *= 1 / (1 + jnp.exp(dist_std - dist_std_mean)) # stdが大きいほど価値を小さく見積もる
+      target *= -jax.nn.relu((dist_std - dist_std_mean)) + 1.0 # stdが大きいほど価値を小さく見積もる
     loss = -dist.log_prob(sg(target))
+    
     if self.config.critic_slowreg == 'logprob':
-      reg = -dist.log_prob(sg(self.slow(traj).mean()))
+        reg = -dist.log_prob(sg(self.slow(traj).mean()))
     elif self.config.critic_slowreg == 'xent':
-      reg = -jnp.einsum(
-          '...i,...i->...',
-          sg(self.slow(traj).probs),
-          jnp.log(dist.probs))
+        reg = -jnp.einsum(
+            '...i,...i->...',
+            sg(self.slow(traj).probs),
+            jnp.log(dist.probs))
     else:
-      raise NotImplementedError(self.config.critic_slowreg)
+        raise NotImplementedError(self.config.critic_slowreg)
+    
     loss += self.config.loss_scales.slowreg * reg
+
     loss = (loss * sg(traj['weight'])).mean()
     loss *= self.config.loss_scales.critic
     metrics = jaxutils.tensorstats(dist.mean())
+    return loss, metrics
+
+  def interp(self, a: dict, b: dict, n: int, f=0.5):
+    swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()}
+    a, b = swap(a), swap(b)
+    value_shape = next(iter((a.values()))).shape
+    rng = jax.random.PRNGKey(0)
+    choice_rng, indices_rng = jax.random.split(rng, 2)
+
+    # f の確率で a から、1 - f の確率で b から選ぶ
+    choices = jax.random.bernoulli(choice_rng, p=f, shape=(n,))
+
+    # 選択したインデックスに基づいてサンプリング
+    indices = jax.random.randint(indices_rng, shape=(n,), minval=0, maxval=value_shape[0])
+    samples = {}
+    for k in a.keys():
+      choices_broadcasted = choices.reshape(n, *([1] * (len(a[k].shape) - 1)))
+      samples[k] = jnp.where(choices_broadcasted, a[k][indices], b[k][indices])
+
+    return swap(samples)
+
+  def conservative_loss(self, img_traj, obs_traj, img_target, obs_target):
+    # Q関数の損失
+    metrics = {}
+    img_traj = {k: v[:-1] for k, v in img_traj.items()}
+    obs_traj = {k: v[:-1] for k, v in obs_traj.items()}
+    obs_traj['target'] = obs_target
+    img_traj['target'] = img_target
+    img_batch_size = next(iter((img_traj.values()))).shape[1]
+    traj = self.interp(obs_traj, img_traj, img_batch_size, f=self.config.loss_scales.conservative_f)
+    target = traj['target']
+
+    dist = self.net(traj)
+    loss = -dist.log_prob(sg(target))
+    
+    if self.config.critic_slowreg == 'logprob':
+        reg = -dist.log_prob(sg(self.slow(traj).mean()))
+    elif self.config.critic_slowreg == 'xent':
+        reg = -jnp.einsum(
+            '...i,...i->...',
+            sg(self.slow(traj).probs),
+            jnp.log(dist.probs))
+    else:
+        raise NotImplementedError(self.config.critic_slowreg)
+    
+    loss += self.config.loss_scales.slowreg * reg
+    loss = (loss * sg(img_traj['weight'])).mean()
+
+    # Conservative Policy Evaluationの計算
+    expected_Q_img, expected_Q_obs = self.net(img_traj).mean(), self.net(obs_traj).mean()
+    expected_Q_img = (expected_Q_img * sg(img_traj['weight'])).mean()
+    expected_Q_obs = (expected_Q_obs * sg(obs_traj['weight'])).mean()
+    conservative_loss = expected_Q_img - expected_Q_obs
+    loss += self.config.loss_scales.conservative * conservative_loss
+
+    loss *= self.config.loss_scales.critic
+    metrics = jaxutils.tensorstats(dist.mean())
+    metrics.update(jaxutils.tensorstats(expected_Q_img, 'expected_Q_img'))
+    metrics.update(jaxutils.tensorstats(expected_Q_obs, 'expected_Q_obs'))
+    metrics.update(jaxutils.tensorstats(conservative_loss, 'conservative_loss'))
     return loss, metrics
 
   def score(self, traj, actor=None):

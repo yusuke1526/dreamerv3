@@ -21,6 +21,7 @@ from .uuid import uuid
 
 from .batch import BatchEnv
 from .random import RandomAgent
+from .autopilot import AutopilotAgent
 from .distr import Client, Server, BatchServer
 
 from . import logger

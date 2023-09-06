@@ -7,8 +7,11 @@ defaults:
   replay: uniform
   replay_size: 1e6
   replay_online: False
+  replaydir: ''
   eval_dir: ''
   filter: '.*'
+  use_wandb: False
+  wandb_user_name: ""
 
   jax:
     platform: gpu
@@ -54,6 +57,41 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0}
     dmc: {size: [64, 64], repeat: 2, camera: -1}
     loconav: {size: [64, 64], repeat: 2, camera: -1}
+    carla: {
+      input_names: ["camera", "lidar"],
+      mask_names: ["birdeye"],
+      number_of_vehicles: 100,
+      number_of_walkers: 0,
+      display_size: 256,
+      max_past_step: 1,
+      dt: 0.1,
+      discrete: False,
+      discrete_acc: [-3.0, 0.0, 3.0],
+      discrete_steer: [-0.2, 0.0, 0.2],
+      acc_coef: 1.0,
+      steer_coef: 1.0,
+      continuous_accel_range: [-1.0, 1.0],
+      continuous_steer_range: [-1.0, 1.0],
+      ego_vehicle_filter: "vehicle.lincoln*",
+      port: 2000,
+      port_eval: 3000,
+      town: "Town03",
+      task_mode: "random",
+      max_time_episode: 500,
+      max_waypt: 12,
+      obs_range: 32,
+      lidar_bin: 0.5,
+      d_behind: 12,
+      out_lane_thres: 2.0,
+      desired_speed: 8,
+      max_ego_spawn_times: 200,
+      display_route: True,
+      pixor_size: 64,
+      pixor: False,
+      auto_exploration: False,
+      host_name: "ueda-carla",
+      repeat: 1,
+    }
 
   # Agent
   task_behavior: Greedy
@@ -69,10 +107,11 @@ defaults:
   decoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, image_dist: mse, vector_dist: symlog_mse, inputs: [deter, stoch], resize: stride, winit: normal, fan: avg, outscale: 1.0, minres: 4, cnn_sigmoid: False}
   reward_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: symlog_disc, outscale: 0.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg, bins: 255}
   cont_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: binary, outscale: 1.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg}
-  loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0}
+  loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0, conservative: 5.0, conservative_f: 0.5, bc: 1.0, imagine: 0.5, kld: 1.0}
   dyn_loss: {impl: kl, free: 1.0}
   rep_loss: {impl: kl, free: 1.0}
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0}
+  freeze_wm: False
 
   # Actor Critic
   actor: {layers: 5, units: 1024, act: silu, norm: layer, minstd: 0.1, maxstd: 1.0, outscale: 1.0, outnorm: False, unimix: 0.01, inputs: [deter, stoch], winit: normal, fan: avg, symlog_inputs: False}
@@ -93,6 +132,10 @@ defaults:
   slow_critic_fraction: 0.02
   retnorm: {impl: perc_ema, decay: 0.99, max: 1.0, perclo: 5.0, perchi: 95.0}
   actent: 3e-4
+  enable_bc: False
+  enable_obs_actor_loss: False
+  enable_combo: False
+  enable_rew_std_gen: False
 
   # Exploration
   expl_rewards: {extr: 1.0, disag: 0.1}
@@ -100,6 +143,20 @@ defaults:
   disag_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: mse, outscale: 1.0, inputs: [deter, stoch, action], winit: normal, fan: avg}
   disag_target: [stoch]
   disag_models: 8
+
+carla:
+  task: carla_drive
+  envs.amount: 1
+  envs.parallel: none
+  batch_size: 16
+  run:
+    log_every: 300
+    train_ratio: 64
+    eval_every: 1000
+    log_keys_video: [birdeye]
+    from_checkpoint: ''
+  encoder: {mlp_keys: '$^', cnn_keys: 'camera|lidar'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'camera|lidar|birdeye'}
 
 minecraft:
 
