@@ -77,7 +77,7 @@ class Agent(nj.Module):
     state = ((latent, outs['action']), task_state, expl_state)
     return outs, state
 
-  def train(self, data, state):
+  def train(self, data, state, pretrain=False):
     self.config.jax.jit and print('Tracing train function.')
     metrics = {}
     data = self.preprocess(data)
@@ -86,26 +86,15 @@ class Agent(nj.Module):
     metrics.update(mets)
     context = {**data, **wm_outs['post']}
     context['embed'] = wm_outs['embed']
-    start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
-    aux_args = {'observe': self.wm.observe}
-    # actor-criticの学習
-    _, mets = self.task_behavior.train(self.wm.imagine, start, context, **aux_args)
-    metrics.update(mets)
-    if self.config.expl_behavior != 'None':
-      _, mets = self.expl_behavior.train(self.wm.imagine, start, context, **aux_args)
-      metrics.update({'expl_' + key: value for key, value in mets.items()})
-    outs = {}
-    return outs, state, metrics
-  
-  def train_wm(self, data, state):
-    self.config.jax.jit and print('Tracing train function.')
-    metrics = {}
-    data = self.preprocess(data)
-    # 世界モデルの学習
-    state, wm_outs, mets = self.wm.train(data, state)
-    metrics.update(mets)
-    context = {**data, **wm_outs['post']}
-    context['embed'] = wm_outs['embed']
+    if not pretrain:
+      start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
+      aux_args = {'observe': self.wm.observe}
+      # actor-criticの学習
+      _, mets = self.task_behavior.train(self.wm.imagine, start, context, **aux_args)
+      metrics.update(mets)
+      if self.config.expl_behavior != 'None':
+        _, mets = self.expl_behavior.train(self.wm.imagine, start, context, **aux_args)
+        metrics.update({'expl_' + key: value for key, value in mets.items()})
     outs = {}
     return outs, state, metrics
 
@@ -232,7 +221,7 @@ class WorldModel(nj.Module):
     context, _ = self.rssm.observe(
         self.encoder(data)[:6], data['action'][:6],
         data['is_first'][:6])
-    start = {k: v[:, -1] for k, v in context.items()}
+    start = {k: v[:, 4] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     openl = self.heads['decoder'](
         self.rssm.imagine(data['action'][:6, 5:], start))
@@ -299,17 +288,20 @@ class ImagActorCritic(nj.Module):
       policy = lambda s: self.actor(sg(s)).sample(seed=nj.rng())
       traj = imagine(policy, start, self.config.imag_horizon)
       loss, metrics = self.loss(traj)
-      if self.enable_bc: # Behavior Cloning
+      if self.config.enable_bc: # Behavior Cloning
         state = {k: v for k, v in context.items() if k in ['deter', 'stoch']}
         predicted_actions = policy(state)
         mse = jnp.mean(jnp.square(predicted_actions - context['action']))
-        loss += self.config.loss_scales.bc * mse
+        if self.config.only_bc:
+          loss = self.config.loss_scales.bc * mse
+        else:
+          loss += self.config.loss_scales.bc * mse
         metrics.update({f'behavior_cloning_mse': mse})
       return loss, (traj, metrics)
     # ポリシーの更新
     mets, (traj, metrics) = self.opt(self.actor, loss, start, has_aux=True)
     metrics.update(mets)
-    # Q関数の更新
+    # 状態価値関数の更新
     for key, critic in self.critics.items():
       if self.enable_combo:
         observe = kwargs.get('observe', None)
@@ -398,8 +390,14 @@ class VFunction(nj.Module):
       dist_std = sg(dist.std())
       print(f'dist_std.shape: {dist_std.shape}')
       dist_std_mean = dist_std.mean(axis=-1, keepdims=True)
-      # target *= 1 / (1 + jnp.exp(dist_std - dist_std_mean)) # stdが大きいほど価値を小さく見積もる
-      target *= -jax.nn.relu((dist_std - dist_std_mean)) + 1.0 # stdが大きいほど価値を小さく見積もる
+      if self.config.rew_std_gen_sigmoid:
+        target *= 1 / (1 + jnp.exp(dist_std - dist_std_mean)) # stdが大きいほど価値を小さく見積もる
+      elif self.config.rew_std_gen_relu:
+        target *= -jax.nn.relu((dist_std - dist_std_mean)) + 1.0 # stdが大きいほど価値を小さく見積もる
+      elif self.config.rew_std_gen_200:
+        target -= 200 / (1 + jnp.exp(-(dist_std - dist_std_mean))) # stdが大きいほど価値を小さく見積もる
+      else:
+        raise NotImplementedError()
     loss = -dist.log_prob(sg(target))
     
     if self.config.critic_slowreg == 'logprob':

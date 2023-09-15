@@ -54,7 +54,14 @@ def main(argv=None):
       env = make_envs(config)
       cleanup.append(env)
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
-      embodied.run.train(agent, env, replay, logger, args)
+      embodied.run.pretrain(agent, env, replay, logger, args)
+
+    elif args.script == 'train_on_dataset':
+      replay = make_replay(config, config.replaydir)
+      env = make_envs(config)
+      cleanup.append(env)
+      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      embodied.run.train_on_dataset(agent, env, replay, logger, args)
 
     elif args.script == 'train_save':
       replay = make_replay(config, logdir / 'replay')

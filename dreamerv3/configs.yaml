@@ -133,9 +133,13 @@ defaults:
   retnorm: {impl: perc_ema, decay: 0.99, max: 1.0, perclo: 5.0, perchi: 95.0}
   actent: 3e-4
   enable_bc: False
+  only_bc: False
   enable_obs_actor_loss: False
   enable_combo: False
   enable_rew_std_gen: False
+  rew_std_gen_sigmoid: False
+  rew_std_gen_relu: False
+  rew_std_gen_200: False
 
   # Exploration
   expl_rewards: {extr: 1.0, disag: 0.1}

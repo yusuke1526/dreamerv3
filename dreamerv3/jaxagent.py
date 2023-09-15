@@ -65,7 +65,7 @@ class JAXAgent(embodied.Agent):
     state = self._convert_outs(state, self.policy_devices)
     return outs, state
 
-  def train(self, data, state=None):
+  def train(self, data, state=None, pretrain=False):
     rng = self._next_rngs(self.train_devices)
     if state is None:
       state, self.varibs = self._init_train(self.varibs, rng, data['is_first'])

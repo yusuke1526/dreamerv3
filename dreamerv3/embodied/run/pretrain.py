@@ -7,6 +7,7 @@ from .plot import plot_action_on_video
 
 
 def pretrain(agent, env, replay, logger, args):
+  print(f'start pretrain wm')
 
   logdir = embodied.Path(args.logdir)
   logdir.mkdirs()
@@ -62,16 +63,22 @@ def pretrain(agent, env, replay, logger, args):
   driver.on_step(replay.add)
 
   print('Prefill train dataset.')
-  if args.task.split('_')[0] == "carla" and args.env.carla.auto_exploration:
-    print('use AutopilotAgent for Prefill train dataset')
-    collect_agent = embodied.AutopilotAgent(env.act_space, env, **args)
-  else:
-    print('use RandomAgent for Prefill train dataset')
-    collect_agent = embodied.RandomAgent(env.act_space)
+  print('use AutopilotAgent for Prefill train dataset')
+  collect_agent = embodied.AutopilotAgent(env.act_space, env, **args)
+#   if args.task.split('_')[0] == "carla" and args.env.carla.auto_exploration:
+#     print('use AutopilotAgent for Prefill train dataset')
+#     collect_agent = embodied.AutopilotAgent(env.act_space, env, **args)
+#   else:
+#     print('use RandomAgent for Prefill train dataset')
+#     collect_agent = embodied.RandomAgent(env.act_space)
   while len(replay) < max(args.batch_steps, args.train_fill):
     driver(collect_agent.policy, steps=100)
   logger.add(metrics.result())
   logger.write()
+  print(driver._on_steps)
+  driver.on_step_pop()
+  print(driver._on_steps)
+  print(f'popped on steps')
 
   dataset = agent.dataset(replay.dataset)
   state = [None]  # To be writable from train step function below.
@@ -80,7 +87,7 @@ def pretrain(agent, env, replay, logger, args):
     for _ in range(should_train(step)):
       with timer.scope('dataset'):
         batch[0] = next(dataset)
-      outs, state[0], mets = agent.train_wm(batch[0], state[0])
+      outs, state[0], mets = agent.train(batch[0], state[0], pretrain=True)
       metrics.add(mets, prefix='train')
       if 'priority' in outs:
         replay.prioritize(outs['key'], outs['priority'])
@@ -109,11 +116,8 @@ def pretrain(agent, env, replay, logger, args):
   should_save(step)  # Register that we jused saved.
 
   print('Start training loop.')
-  policy = lambda *args: agent.policy(
-      *args, mode='explore' if should_expl(step) else 'train')
   while step < args.steps:
-    step.increment()
-    train_step(None, None)
+    driver(collect_agent.policy, steps=100)
     if should_save(step):
       checkpoint.save()
   logger.write()

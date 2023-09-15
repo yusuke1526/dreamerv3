@@ -33,6 +33,9 @@ class Driver:
   def on_step(self, callback):
     self._on_steps.append(callback)
 
+  def on_step_pop(self):
+    self._on_steps.pop()
+
   def on_episode(self, callback):
     self._on_episodes.append(callback)
 
