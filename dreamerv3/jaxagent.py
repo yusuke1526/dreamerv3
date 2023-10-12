@@ -65,11 +65,49 @@ class JAXAgent(embodied.Agent):
     state = self._convert_outs(state, self.policy_devices)
     return outs, state
 
-  def train(self, data, state=None, pretrain=False):
+  def train(self, data, state=None):
     rng = self._next_rngs(self.train_devices)
     if state is None:
       state, self.varibs = self._init_train(self.varibs, rng, data['is_first'])
     (outs, state, mets), self.varibs = self._train(
+        self.varibs, rng, data, state)
+    outs = self._convert_outs(outs, self.train_devices)
+    self._updates.increment()
+    if self._should_metrics(self._updates):
+      mets = self._convert_mets(mets, self.train_devices)
+    else:
+      mets = {}
+    if self._once:
+      self._once = False
+      assert jaxutils.Optimizer.PARAM_COUNTS
+      for name, count in jaxutils.Optimizer.PARAM_COUNTS.items():
+        mets[f'params_{name}'] = float(count)
+    return outs, state, mets
+  
+  def pretrain_wm(self, data, state=None):
+    rng = self._next_rngs(self.train_devices)
+    if state is None:
+      state, self.varibs = self._init_train(self.varibs, rng, data['is_first'])
+    (outs, state, mets), self.varibs = self._pretrain_wm(
+        self.varibs, rng, data, state)
+    outs = self._convert_outs(outs, self.train_devices)
+    self._updates.increment()
+    if self._should_metrics(self._updates):
+      mets = self._convert_mets(mets, self.train_devices)
+    else:
+      mets = {}
+    if self._once:
+      self._once = False
+      assert jaxutils.Optimizer.PARAM_COUNTS
+      for name, count in jaxutils.Optimizer.PARAM_COUNTS.items():
+        mets[f'params_{name}'] = float(count)
+    return outs, state, mets
+  
+  def train_actor_critic(self, data, state=None):
+    rng = self._next_rngs(self.train_devices)
+    if state is None:
+      state, self.varibs = self._init_train(self.varibs, rng, data['is_first'])
+    (outs, state, mets), self.varibs = self._train_actor_critic(
         self.varibs, rng, data, state)
     outs = self._convert_outs(outs, self.train_devices)
     self._updates.increment()
@@ -156,16 +194,22 @@ class JAXAgent(embodied.Agent):
     self._init_train = nj.pure(lambda x: self.agent.train_initial(len(x)))
     self._policy = nj.pure(self.agent.policy)
     self._train = nj.pure(self.agent.train)
+    self._pretrain_wm = nj.pure(self.agent.pretrain_wm)
+    self._train_actor_critic = nj.pure(self.agent.train_actor_critic)
     self._report = nj.pure(self.agent.report)
     if len(self.train_devices) == 1:
       kw = dict(device=self.train_devices[0])
       self._init_train = nj.jit(self._init_train, **kw)
       self._train = nj.jit(self._train, **kw)
+      self._pretrain_wm = nj.jit(self._pretrain_wm, **kw)
+      self._train_actor_critic = nj.jit(self._train_actor_critic, **kw)
       self._report = nj.jit(self._report, **kw)
     else:
       kw = dict(devices=self.train_devices)
       self._init_train = nj.pmap(self._init_train, 'i', **kw)
       self._train = nj.pmap(self._train, 'i', **kw)
+      self._pretrain_wm = nj.pmap(self._pretrain_wm, 'i', **kw)
+      self._train_actor_critic = nj.pmap(self._train_actor_critic, 'i', **kw)
       self._report = nj.pmap(self._report, 'i', **kw)
     if len(self.policy_devices) == 1:
       kw = dict(device=self.policy_devices[0])

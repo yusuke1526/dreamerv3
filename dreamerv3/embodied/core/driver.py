@@ -20,6 +20,8 @@ class Driver:
     self._kwargs = kwargs
     self._on_steps = []
     self._on_episodes = []
+    self._latents = []
+    self._trns_keys = []
     self.reset()
 
   def reset(self):
@@ -51,13 +53,27 @@ class Driver:
     obs = {k: convert(v) for k, v in obs.items()}
     assert all(len(x) == len(self._env) for x in obs.values()), obs
     acts, self._state = policy(obs, self._state, **self._kwargs)
+    
     acts = {k: convert(v) for k, v in acts.items()}
     if obs['is_last'].any():
       mask = 1 - obs['is_last']
       acts = {k: v * self._expand(mask, len(v.shape)) for k, v in acts.items()}
     acts['reset'] = obs['is_last'].copy()
     self._acts = acts
-    trns = {**obs, **acts}
+
+    # RandomAgentはstateをNoneで返す
+    if isinstance(self._state, tuple):
+      ((latent, _), _, _) = self._state
+      trns = {**obs, **acts, **latent}
+    else:
+      trns = {**obs, **acts}
+
+    # trnsのkeyが変化しない様にする
+    if len(self._trns_keys) == 0:
+      self._trns_keys = list(trns.keys())
+    else:
+      trns = {k: trns[k] for k in self._trns_keys}
+    
     if obs['is_first'].any():
       for i, first in enumerate(obs['is_first']):
         if first:

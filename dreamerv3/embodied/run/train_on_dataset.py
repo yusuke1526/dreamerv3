@@ -61,15 +61,6 @@ def train_on_dataset(agent, env, replay, logger, args):
   driver.on_episode(lambda ep, worker: per_episode(ep))
   driver.on_step(lambda tran, _: step.increment())
 
-  print('Prefill train dataset.')
-  if args.task.split('_')[0] == "carla" and args.env.carla.auto_exploration:
-    print('use AutopilotAgent for Prefill train dataset')
-    collect_agent = embodied.AutopilotAgent(env.act_space, env, **args)
-  else:
-    print('use RandomAgent for Prefill train dataset')
-    collect_agent = embodied.RandomAgent(env.act_space)
-  while len(replay) < max(args.batch_steps, args.train_fill):
-    driver(collect_agent.policy, steps=100)
   logger.add(metrics.result())
   logger.write()
 
@@ -80,7 +71,7 @@ def train_on_dataset(agent, env, replay, logger, args):
     for _ in range(should_train(step)):
       with timer.scope('dataset'):
         batch[0] = next(dataset)
-      outs, state[0], mets = agent.train(batch[0], state[0])
+      outs, state[0], mets = agent.train_actor_critic(batch[0], state[0])
       metrics.add(mets, prefix='train')
       if 'priority' in outs:
         replay.prioritize(outs['key'], outs['priority'])
@@ -107,14 +98,6 @@ def train_on_dataset(agent, env, replay, logger, args):
     checkpoint.load(args.from_checkpoint)
   checkpoint.load_or_save()
   should_save(step)  # Register that we jused saved.
-
-  if args.freeze_wm:
-    # fix wm weights
-    frozen_weights = agent.wm.params
-    # 重みを凍結する（トレーニング中に更新されないようにする）
-    frozen_weights = jax.tree_map(jax.lax.stop_gradient, frozen_weights)
-    # 凍結した重みをモデルに設定
-    agent.wm.dense1 = agent.wm.replace(params=frozen_weights)
 
   print('Start training loop.')
   policy = lambda *args: agent.policy(

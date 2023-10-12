@@ -31,6 +31,8 @@ class Greedy(nj.Module):
   def report(self, data):
     return {}
 
+  def img_report(self, data):
+    return {}
 
 class Random(nj.Module):
 
@@ -55,6 +57,9 @@ class Random(nj.Module):
     return None, {}
 
   def report(self, data):
+    return {}
+  
+  def img_report(self, data):
     return {}
 
 
@@ -99,4 +104,7 @@ class Explore(nj.Module):
     return traj, metrics
 
   def report(self, data):
+    return {}
+  
+  def img_report(self, data):
     return {}

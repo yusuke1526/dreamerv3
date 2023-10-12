@@ -56,6 +56,8 @@ class Agent(nj.Module):
     self.config.jax.jit and print('Tracing policy function.')
     obs = self.preprocess(obs)
     (prev_latent, prev_action), task_state, expl_state = state
+    # value を取り除く
+    prev_latent = {k: v for k, v in prev_latent.items() if 'value' not in k}
     embed = self.wm.encoder(obs)
     latent, _ = self.wm.rssm.obs_step(
         prev_latent, prev_action, embed, obs['is_first'])
@@ -74,10 +76,12 @@ class Agent(nj.Module):
       outs = task_outs
       outs['log_entropy'] = outs['action'].entropy()
       outs['action'] = outs['action'].sample(seed=nj.rng())
+    for key, critic in self.task_behavior.ac.critics.items():
+      latent[f'{key}_value'] = critic.net(latent).mean()
     state = ((latent, outs['action']), task_state, expl_state)
     return outs, state
 
-  def train(self, data, state, pretrain=False):
+  def train(self, data, state):
     self.config.jax.jit and print('Tracing train function.')
     metrics = {}
     data = self.preprocess(data)
@@ -86,21 +90,53 @@ class Agent(nj.Module):
     metrics.update(mets)
     context = {**data, **wm_outs['post']}
     context['embed'] = wm_outs['embed']
-    if not pretrain:
-      start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
-      aux_args = {'observe': self.wm.observe}
-      # actor-criticの学習
-      _, mets = self.task_behavior.train(self.wm.imagine, start, context, **aux_args)
-      metrics.update(mets)
-      if self.config.expl_behavior != 'None':
-        _, mets = self.expl_behavior.train(self.wm.imagine, start, context, **aux_args)
-        metrics.update({'expl_' + key: value for key, value in mets.items()})
+    start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
+    aux_args = {'observe': self.wm.observe}
+    # actor-criticの学習
+    _, mets = self.task_behavior.train(self.wm.imagine, start, context, **aux_args)
+    metrics.update(mets)
+    if self.config.expl_behavior != 'None':
+      _, mets = self.expl_behavior.train(self.wm.imagine, start, context, **aux_args)
+      metrics.update({'expl_' + key: value for key, value in mets.items()})
+    outs = {}
+    return outs, state, metrics
+  
+  def pretrain_wm(self, data, state):
+    self.config.jax.jit and print('Tracing pretrain_wm function.')
+    metrics = {}
+    data = self.preprocess(data)
+    # 世界モデルの学習
+    state, _, mets = self.wm.train(data, state)
+    metrics.update(mets)
+    outs = {}
+    return outs, state, metrics
+  
+  def train_actor_critic(self, data, state):
+    self.config.jax.jit and print('Tracing train function.')
+    metrics = {}
+    data = self.preprocess(data)
+    # 世界モデルの推論
+    _, (state, wm_outs, mets) = self.wm.loss(data, state)
+    metrics.update(mets)
+    context = {**data, **wm_outs['post']}
+    context['embed'] = wm_outs['embed']
+    # stop-gradient
+    context = sg(context)
+    start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
+    aux_args = {'observe': self.wm.observe}
+    # actor-criticの学習
+    _, mets = self.task_behavior.train(self.wm.imagine, start, context, **aux_args)
+    metrics.update(mets)
+    if self.config.expl_behavior != 'None':
+      _, mets = self.expl_behavior.train(self.wm.imagine, start, context, **aux_args)
+      metrics.update({'expl_' + key: value for key, value in mets.items()})
     outs = {}
     return outs, state, metrics
 
   def report(self, data):
     self.config.jax.jit and print('Tracing report function.')
     data = self.preprocess(data)
+
     report = {}
     report.update(self.wm.report(data))
     mets = self.task_behavior.report(data)
@@ -108,6 +144,18 @@ class Agent(nj.Module):
     if self.expl_behavior is not self.task_behavior:
       mets = self.expl_behavior.report(data)
       report.update({f'expl_{k}': v for k, v in mets.items()})
+
+    # imagination report
+    img_report = {}
+    policy = lambda s: self.task_behavior.ac.actor(sg(s)).sample(seed=nj.rng())
+    img_report.update(self.wm.img_report(data, policy))
+    mets = self.task_behavior.img_report(data)
+    img_report.update({f'task_{k}': v for k, v in mets.items()})
+    if self.expl_behavior is not self.task_behavior:
+      mets = self.expl_behavior.img_report(data)
+      img_report.update({f'expl_{k}': v for k, v in mets.items()})
+    report.update({f'{k}_img': v for k, v in img_report.items()})
+
     return report
 
   def preprocess(self, obs):
@@ -207,12 +255,14 @@ class WorldModel(nj.Module):
     return traj
   
   def observe(self, embed, action, is_first, context, state=None):
+    swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()}
     post, _ = self.rssm.observe(embed, action, is_first, state)
     obs_traj = {'action': action, **post}
     obs_traj['cont'] = (1.0 - context['is_terminal']).astype(jnp.float32)
     discount = 1 - 1 / self.config.horizon
     obs_traj['weight'] = jnp.cumprod(discount * obs_traj['cont'], 0) / discount
-    return obs_traj
+
+    return swap(obs_traj)
 
   def report(self, data):
     state = self.initial(len(data['is_first']))
@@ -232,6 +282,26 @@ class WorldModel(nj.Module):
       video = jnp.concatenate([truth, recon[key].mode(), model, error], 2)
       report[f'openl_{key}'] = jaxutils.video_grid(video)
     return report
+  
+  def img_report(self, data, policy):
+    swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()} 
+    img_report = {}
+    context, _ = self.rssm.observe(
+        self.encoder(data)[:6], data['action'][:6],
+        data['is_first'][:6])
+    print(f'context.keys(): {context.keys()}')
+    context.update({k: v[:6] for k, v in data.items() if k not in set(context.keys())})
+    print(f'context.keys(): {context.keys()}')
+    start = {k: v[:, 4] for k, v in context.items()}
+    recon = self.heads['decoder'](context)
+    traj = self.imagine(policy, start, self.config.imag_horizon)
+    traj = swap(traj)
+    openl = self.heads['decoder'](traj)
+    for key in self.heads['decoder'].cnn_shapes.keys():
+      model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
+      video = jnp.concatenate([model], 2)
+      img_report[f'openl_{key}'] = jaxutils.video_grid(video)
+    return img_report
 
   def _metrics(self, data, dists, post, prior, losses, model_loss):
     entropy = lambda feat: self.rssm.get_dist(feat).entropy()
@@ -274,7 +344,33 @@ class ImagActorCritic(nj.Module):
     self.opt = jaxutils.Optimizer(name='actor_opt', **config.actor_opt)
     self.enable_obs_actor_loss = config.enable_obs_actor_loss
     self.enable_bc = config.enable_bc
-    self.enable_combo = config.enable_combo
+    self.random_behavior = behaviors.Random(None, act_space, config, name='random_behavior')
+
+  def sample_dict_array(self, d: dict, n: int):
+    '''
+    Args: d is a dict of arrays
+    Return: a dict of arrays have n samples
+    '''
+    swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()}
+    d = swap(d)
+    batch_size = next(iter((d.values()))).shape[0]
+    assert n <= batch_size, f'n must be less than batch_size, but n: {n} and batch_size: {batch_size}'
+    rng = jax.random.PRNGKey(0)
+
+    # 0からnまでの整数のリストを作成
+    population = jnp.arange(batch_size)
+    
+    # シャッフルされたリストから最初のk個の要素を選択
+    shuffled_indices = jax.random.shuffle(rng, population)
+    sample_indices = shuffled_indices[:n]
+    
+
+    # 選択したインデックスに基づいてサンプリング
+    samples = {}
+    for k in d.keys():
+      samples[k] = d[k][sample_indices]
+
+    return swap(samples)
 
   def initial(self, batch_size):
     return {}
@@ -283,11 +379,30 @@ class ImagActorCritic(nj.Module):
     return {'action': self.actor(state)}, carry
 
   def train(self, imagine, start, context, **kwargs):
+    if self.config.enable_combo:
+      observe = kwargs.get('observe', None)
+
     # ポリシーの損失
     def loss(start):
       policy = lambda s: self.actor(sg(s)).sample(seed=nj.rng())
       traj = imagine(policy, start, self.config.imag_horizon)
-      loss, metrics = self.loss(traj)
+      if self.config.enable_combo and self.config.enable_combo_to_actor:
+        obs_traj = observe(context['embed'], context['action'], context['is_first'], context)
+        obs_batch_size = next(iter((obs_traj.values()))).shape[1]
+        traj = self.sample_dict_array(traj, obs_batch_size)
+        traj_dict = {'img_traj': traj, "obs_traj": obs_traj}
+
+        if self.config.combo_random_policy:
+          random_policy = lambda s: self.random_behavior.policy(None, s['deter'])[0]['action'].sample(seed=nj.rng())
+          random_traj = imagine(random_policy, start, self.config.imag_horizon)
+          obs_batch_size = list(traj_dict['obs_traj'].values())[0].shape[1]
+          random_traj = self.sample_dict_array(random_traj, obs_batch_size)
+          traj_dict['random_traj'] = random_traj
+
+        loss, metrics = self.combo_loss(traj_dict)
+        traj = traj_dict
+      else:
+        loss, metrics = self.loss(traj)
       if self.config.enable_bc: # Behavior Cloning
         state = {k: v for k, v in context.items() if k in ['deter', 'stoch']}
         predicted_actions = policy(state)
@@ -298,17 +413,14 @@ class ImagActorCritic(nj.Module):
           loss += self.config.loss_scales.bc * mse
         metrics.update({f'behavior_cloning_mse': mse})
       return loss, (traj, metrics)
+
     # ポリシーの更新
     mets, (traj, metrics) = self.opt(self.actor, loss, start, has_aux=True)
     metrics.update(mets)
+
     # 状態価値関数の更新
     for key, critic in self.critics.items():
-      if self.enable_combo:
-        observe = kwargs.get('observe', None)
-        obs_traj = observe(context['embed'], context['action'], context['is_first'], context)
-        mets = critic.train((traj, obs_traj), self.actor)
-      else:
-        mets = critic.train(traj, self.actor)
+      mets = critic.train(traj, self.actor)
       metrics.update({f'{key}_critic_{k}': v for k, v in mets.items()})
     return traj, metrics
 
@@ -336,6 +448,61 @@ class ImagActorCritic(nj.Module):
     loss *= self.config.loss_scales.actor
     metrics.update(self._metrics(traj, policy, logpi, ent, adv))
     return loss.mean(), metrics
+  
+  def combo_loss(self, traj_dict):
+    metrics = {}
+    advs = []
+    total = sum(self.scales[k] for k in self.critics)
+    # traj = {k: jnp.concatenate([img_traj[k], obs_traj[k]], axis=1) for k in img_traj.keys()}
+    obs_traj, img_traj = traj_dict['obs_traj'], traj_dict['img_traj']
+    traj = interp(obs_traj, img_traj, f=self.config.loss_scales.conservative_f)
+    print(f'traj_shape: {next(iter((traj.values()))).shape}')
+    for key, critic in self.critics.items():
+      rew, ret, base = critic.score(traj, self.actor)
+      offset, invscale = self.retnorms[key](ret)
+      normed_ret = (ret - offset) / invscale
+      normed_base = (base - offset) / invscale
+      advs.append((normed_ret - normed_base) * self.scales[key] / total)
+      metrics.update(jaxutils.tensorstats(rew, f'{key}_reward'))
+      metrics.update(jaxutils.tensorstats(ret, f'{key}_return_raw'))
+      metrics.update(jaxutils.tensorstats(normed_ret, f'{key}_return_normed'))
+      metrics[f'{key}_return_rate'] = (jnp.abs(ret) >= 0.5).mean()
+    adv = jnp.stack(advs).sum(0)
+    policy = self.actor(sg(traj))
+    logpi = policy.log_prob(sg(traj['action']))[:-1]
+    loss = {'backprop': -adv, 'reinforce': -logpi * sg(adv)}[self.grad]
+    ent = policy.entropy()[:-1]
+    loss -= self.config.actent * ent
+    loss *= sg(traj['weight'])[:-1]
+    loss = loss.mean()
+
+    # 正則化
+    img_log_prob = self.actor(sg(img_traj)).log_prob(sg(img_traj['action']))[:-1]
+    img_log_prob *= sg(img_traj['weight'])[:-1]
+    if self.config.combo_random_policy:
+      random_traj = traj_dict["random_traj"]
+      ran_prob = jnp.ones(random_traj['action'][:-1].shape[:-1]) * 0.5
+      ran_log_prob = jnp.log(ran_prob**random_traj['action'].shape[-1])
+      ran_log_prob *= sg(random_traj['weight'])[:-1]
+      print(f'img_log_prob.shape: {img_log_prob.shape}')
+      print(f'ran_log_prob.shape: {ran_log_prob.shape}')
+      img_ran_log_prob_diff = img_log_prob - ran_log_prob
+      img_log_prob = jnp.stack([img_log_prob, ran_log_prob], axis=-1)
+      img_log_prob = jax.nn.logsumexp(img_log_prob / self.config.logsumexp_temp, axis=-1)
+    obs_log_prob = self.actor(sg(obs_traj)).log_prob(sg(obs_traj['action']))[:-1]
+    obs_log_prob *= sg(obs_traj['weight'])[:-1]
+    log_prob_term = img_log_prob - obs_log_prob
+    log_prob_term *= self.config.loss_scales.conservative
+    loss += log_prob_term.mean()
+
+    loss *= self.config.loss_scales.actor
+    metrics.update(self._metrics(traj, policy, logpi, ent, adv))
+    metrics.update(jaxutils.tensorstats(img_log_prob, 'img_log_prob'))
+    metrics.update(jaxutils.tensorstats(obs_log_prob, 'obs_log_prob'))
+    if self.config.combo_random_policy:
+      metrics.update(jaxutils.tensorstats(ran_log_prob, 'ran_log_prob'))
+      metrics.update(jaxutils.tensorstats(img_ran_log_prob_diff, 'img_ran_log_prob_diff'))
+    return loss, metrics
 
   def _metrics(self, traj, policy, logpi, ent, adv):
     metrics = {}
@@ -365,16 +532,17 @@ class VFunction(nj.Module):
         self.config.slow_critic_fraction,
         self.config.slow_critic_update)
     self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
-    self.recursive_count = 0
-    self.recursive_mean = 0.0
+    if self.config.with_lagrange:
+      self.lagrange_opt = jaxutils.Optimizer(name='lagrange_opt', **self.config.lagrange_opt)
+      # with jax.transfer_guard("allow"):
+      #   self.cql_log_alpha = jax.device_put(jnp.zeros(1), device=jax.devices("gpu")[0])
+      self.cql_log_alpha = nj.Variable(jnp.zeros, (), name='cql_log_alpha')
 
   def train(self, traj, actor):
     if self.config.enable_combo:
-      assert isinstance(traj, tuple), f'the type of traj is invalid: {type(traj)}'
-      img_traj, obs_traj = traj
-      img_target = sg(self.score(img_traj)[1])
-      obs_target = sg(self.score(obs_traj)[1])
-      mets, metrics = self.opt(self.net, self.conservative_loss, img_traj, obs_traj, img_target, obs_target, has_aux=True)
+      assert isinstance(traj, dict), f'the type of traj is invalid: {type(traj)}'
+      target = {k: sg(self.score(v)[1]) for k, v in traj.items()}
+      mets, metrics = self.opt(self.net, self.conservative_loss, traj, target, has_aux=True)
     else:
       target = sg(self.score(traj)[1])
       mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
@@ -386,16 +554,18 @@ class VFunction(nj.Module):
     metrics = {}
     traj = {k: v[:-1] for k, v in traj.items()}
     dist = self.net(traj)
+    metrics = jaxutils.tensorstats(dist.mean())
     if self.config.enable_rew_std_gen:
       dist_std = sg(dist.std())
-      print(f'dist_std.shape: {dist_std.shape}')
-      dist_std_mean = dist_std.mean(axis=-1, keepdims=True)
+      standardized_dist_std = (dist_std - dist_std.mean(axis=-1, keepdims=True)) / (dist_std.std(axis=-1, keepdims=True) + 1e-8)
+      metrics.update(jaxutils.tensorstats(dist_std, 'dist_std'))
+      metrics.update(jaxutils.tensorstats(standardized_dist_std, 'standardized_dist_std'))
       if self.config.rew_std_gen_sigmoid:
-        target *= 1 / (1 + jnp.exp(dist_std - dist_std_mean)) # stdが大きいほど価値を小さく見積もる
+        target *= 1 / (1 + jnp.exp(standardized_dist_std)) # stdが大きいほど価値を小さく見積もる
       elif self.config.rew_std_gen_relu:
-        target *= -jax.nn.relu((dist_std - dist_std_mean)) + 1.0 # stdが大きいほど価値を小さく見積もる
+        target *= -jax.nn.relu(standardized_dist_std) + 1.0 # stdが大きいほど価値を小さく見積もる
       elif self.config.rew_std_gen_200:
-        target -= 200 / (1 + jnp.exp(-(dist_std - dist_std_mean))) # stdが大きいほど価値を小さく見積もる
+        target -= 200 / (1 + jnp.exp(-standardized_dist_std)) # stdが大きいほど価値を小さく見積もる
       else:
         raise NotImplementedError()
     loss = -dist.log_prob(sg(target))
@@ -414,37 +584,47 @@ class VFunction(nj.Module):
 
     loss = (loss * sg(traj['weight'])).mean()
     loss *= self.config.loss_scales.critic
-    metrics = jaxutils.tensorstats(dist.mean())
     return loss, metrics
 
-  def interp(self, a: dict, b: dict, n: int, f=0.5):
-    swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()}
-    a, b = swap(a), swap(b)
-    value_shape = next(iter((a.values()))).shape
-    rng = jax.random.PRNGKey(0)
-    choice_rng, indices_rng = jax.random.split(rng, 2)
+  # def interp(self, a: dict, b: dict, n: int, f=0.5):
+  #   '''
+  #   sampling datapoints from a with probability f, or from b with probability 1-f.
+  #   '''
+  #   swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()}
+  #   a, b = swap(a), swap(b)
+  #   value_shape = next(iter((a.values()))).shape
+  #   rng = jax.random.PRNGKey(0)
+  #   choice_rng, indices_rng = jax.random.split(rng, 2)
 
-    # f の確率で a から、1 - f の確率で b から選ぶ
-    choices = jax.random.bernoulli(choice_rng, p=f, shape=(n,))
+  #   # f の確率で a から、1 - f の確率で b から選ぶ
+  #   choices = jax.random.bernoulli(choice_rng, p=f, shape=(n,))
 
-    # 選択したインデックスに基づいてサンプリング
-    indices = jax.random.randint(indices_rng, shape=(n,), minval=0, maxval=value_shape[0])
-    samples = {}
-    for k in a.keys():
-      choices_broadcasted = choices.reshape(n, *([1] * (len(a[k].shape) - 1)))
-      samples[k] = jnp.where(choices_broadcasted, a[k][indices], b[k][indices])
+  #   # 選択したインデックスに基づいてサンプリング
+  #   indices = jax.random.randint(indices_rng, shape=(n,), minval=0, maxval=value_shape[0])
+  #   samples = {}
+  #   for k in a.keys():
+  #     choices_broadcasted = choices.reshape(n, *([1] * (len(a[k].shape) - 1)))
+  #     samples[k] = jnp.where(choices_broadcasted, a[k][indices], b[k][indices])
 
-    return swap(samples)
-
-  def conservative_loss(self, img_traj, obs_traj, img_target, obs_target):
-    # Q関数の損失
+  #   return swap(samples)
+  
+  def conservative_loss(self, traj, target):
+    # V関数の損失
     metrics = {}
-    img_traj = {k: v[:-1] for k, v in img_traj.items()}
-    obs_traj = {k: v[:-1] for k, v in obs_traj.items()}
-    obs_traj['target'] = obs_target
-    img_traj['target'] = img_target
-    img_batch_size = next(iter((img_traj.values()))).shape[1]
-    traj = self.interp(obs_traj, img_traj, img_batch_size, f=self.config.loss_scales.conservative_f)
+    traj = {key: {k: v[:-1] for k, v in trajectory.items()} for key, trajectory in traj.items()}
+
+    img_traj = traj["img_traj"]
+    obs_traj = traj["obs_traj"]
+    if self.config.combo_random_policy:
+      random_traj = traj["random_traj"]
+
+    print(f'img_traj_shape: {list(traj["img_traj"].values())[0].shape}')
+    print(f'obs_traj_shape: {list(traj["obs_traj"].values())[0].shape}')
+
+    img_traj['target'] = target["img_traj"]
+    obs_traj['target'] = target["obs_traj"]
+
+    traj = interp(obs_traj, img_traj, f=self.config.loss_scales.conservative_f)
     target = traj['target']
 
     dist = self.net(traj)
@@ -461,21 +641,82 @@ class VFunction(nj.Module):
         raise NotImplementedError(self.config.critic_slowreg)
     
     loss += self.config.loss_scales.slowreg * reg
-    loss = (loss * sg(img_traj['weight'])).mean()
+    loss = (loss * sg(traj['weight'])).mean()
 
     # Conservative Policy Evaluationの計算
-    expected_Q_img, expected_Q_obs = self.net(img_traj).mean(), self.net(obs_traj).mean()
-    expected_Q_img = (expected_Q_img * sg(img_traj['weight'])).mean()
-    expected_Q_obs = (expected_Q_obs * sg(obs_traj['weight'])).mean()
-    conservative_loss = expected_Q_img - expected_Q_obs
-    loss += self.config.loss_scales.conservative * conservative_loss
+    expected_V_img = self.net(img_traj).mean() * sg(img_traj['weight'])
+    expected_V_obs = self.net(obs_traj).mean() * sg(obs_traj['weight'])
+    if self.config.combo_random_policy:
+      expected_V_ran = self.net(random_traj).mean() * sg(random_traj['weight'])
+      expected_V_img = jnp.stack([expected_V_img, expected_V_ran], axis=-1)
+      expected_V_img = jax.nn.logsumexp(expected_V_img / self.config.logsumexp_temp, axis=-1)
+    expected_V_img, expected_V_obs = expected_V_img.mean(), expected_V_obs.mean()
+    conservative_loss = expected_V_img - expected_V_obs
+
+    if self.config.with_lagrange:
+      def lagrange_loss(conservative_loss):
+        cql_alpha = jax.lax.clamp(0.0, jnp.exp(self.cql_log_alpha.read()), 1e6)
+        conservative_loss = cql_alpha * (conservative_loss - self.config.lagrange_threshold)
+        cql_alpha_loss = -conservative_loss
+        return cql_alpha_loss, conservative_loss
+      lagrange_metrics, conservative_loss = self.lagrange_opt(self.cql_log_alpha, lagrange_loss, conservative_loss, has_aux=True)
+
+    conservative_loss *= self.config.loss_scales.conservative
+    loss += conservative_loss
 
     loss *= self.config.loss_scales.critic
     metrics = jaxutils.tensorstats(dist.mean())
-    metrics.update(jaxutils.tensorstats(expected_Q_img, 'expected_Q_img'))
-    metrics.update(jaxutils.tensorstats(expected_Q_obs, 'expected_Q_obs'))
+    metrics.update(jaxutils.tensorstats(expected_V_img, 'expected_V_img'))
+    metrics.update(jaxutils.tensorstats(expected_V_obs, 'expected_V_obs'))
     metrics.update(jaxutils.tensorstats(conservative_loss, 'conservative_loss'))
+    if self.config.combo_random_policy:
+      metrics.update(jaxutils.tensorstats(expected_V_ran, 'expected_V_ran'))
+    if self.config.with_lagrange:
+      metrics.update(jaxutils.tensorstats(self.cql_log_alpha.read(), 'cql_log_alpha'))
+      metrics.update(lagrange_metrics)
     return loss, metrics
+
+  # def conservative_loss(self, img_traj, obs_traj, img_target, obs_target):
+  #   # V関数の損失
+  #   metrics = {}
+  #   img_traj = {k: v[:-1] for k, v in img_traj.items()}
+  #   obs_traj = {k: v[:-1] for k, v in obs_traj.items()}
+  #   print(f'img_traj_shape: {list(img_traj.values())[0].shape}')
+  #   print(f'obs_traj_shape: {list(obs_traj.values())[0].shape}')
+  #   obs_traj['target'] = obs_target
+  #   img_traj['target'] = img_target
+  #   traj = {k: jnp.concatenate([img_traj[k], obs_traj[k]], axis=1) for k in img_traj.keys()}
+  #   target = traj['target']
+
+  #   dist = self.net(traj)
+  #   loss = -dist.log_prob(sg(target))
+    
+  #   if self.config.critic_slowreg == 'logprob':
+  #       reg = -dist.log_prob(sg(self.slow(traj).mean()))
+  #   elif self.config.critic_slowreg == 'xent':
+  #       reg = -jnp.einsum(
+  #           '...i,...i->...',
+  #           sg(self.slow(traj).probs),
+  #           jnp.log(dist.probs))
+  #   else:
+  #       raise NotImplementedError(self.config.critic_slowreg)
+    
+  #   loss += self.config.loss_scales.slowreg * reg
+  #   loss = (loss * sg(traj['weight'])).mean()
+
+  #   # Conservative Policy Evaluationの計算
+  #   expected_V_img, expected_V_obs = self.net(img_traj).mean(), self.net(obs_traj).mean()
+  #   expected_V_img = (expected_V_img * sg(img_traj['weight'])).mean()
+  #   expected_V_obs = (expected_V_obs * sg(obs_traj['weight'])).mean()
+  #   conservative_loss = expected_V_img - expected_V_obs
+  #   loss += self.config.loss_scales.conservative * conservative_loss
+
+  #   loss *= self.config.loss_scales.critic
+  #   metrics = jaxutils.tensorstats(dist.mean())
+  #   metrics.update(jaxutils.tensorstats(expected_V_img, 'expected_V_img'))
+  #   metrics.update(jaxutils.tensorstats(expected_V_obs, 'expected_V_obs'))
+  #   metrics.update(jaxutils.tensorstats(conservative_loss, 'conservative_loss'))
+  #   return loss, metrics
 
   def score(self, traj, actor=None):
     rew = self.rewfn(traj)
@@ -490,3 +731,25 @@ class VFunction(nj.Module):
       vals.append(interm[t] + disc[t] * self.config.return_lambda * vals[-1])
     ret = jnp.stack(list(reversed(vals))[:-1])
     return rew, ret, value[:-1]
+  
+def interp(a: dict, b: dict, f=0.5):
+  '''
+  sampling datapoints from a with probability f, or from b with probability 1-f.
+  '''
+
+  swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()}
+  a, b = swap(a), swap(b)
+  value_shape = next(iter((a.values()))).shape
+  n = value_shape[0]
+  rng = jax.random.PRNGKey(0)
+
+  # f の確率で a から、1 - f の確率で b から選ぶ
+  choices = jax.random.bernoulli(rng, p=f, shape=(n,))
+
+  # 選択したインデックスに基づいてサンプリング
+  samples = {}
+  for k in a.keys():
+    choices_broadcasted = choices.reshape(n, *([1] * (len(a[k].shape) - 1)))
+    samples[k] = jnp.where(choices_broadcasted, a[k], b[k])
+
+  return swap(samples)
