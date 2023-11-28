@@ -36,8 +36,6 @@ class Chunk:
       self.data = {
           k: np.empty((self.size,) + v.shape, v.dtype)
           for k, v in example.items()}
-    print(f'step.keys(): {step.keys()}')
-    print(f'self.data.keys(): {self.data.keys()}')
     for key, value in step.items():
       self.data[key][self.length] = value
     self.length += 1

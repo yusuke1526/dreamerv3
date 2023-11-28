@@ -146,6 +146,8 @@ defaults:
   logsumexp_temp: 1.0
   lagrange_threshold: 10.0
   with_lagrange: False
+  negative_img_log_prob: False
+  add_negative_obs_log_prob: False
 
   # Exploration
   expl_rewards: {extr: 1.0, disag: 0.1}

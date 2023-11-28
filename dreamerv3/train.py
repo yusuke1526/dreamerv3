@@ -111,6 +111,13 @@ def main(argv=None):
       embodied.run.parallel(
           agent, replay, logger, bind(make_env, config),
           num_envs=config.envs.amount, args=args)
+      
+    elif args.script == 'collect':
+      replay = make_replay(config, config.replaydir)
+      env = make_envs(config)
+      cleanup.append(env)
+      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      embodied.run.collect(agent, env, replay, logger, args)
 
     else:
       raise NotImplementedError(args.script)

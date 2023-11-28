@@ -345,6 +345,7 @@ class ImagActorCritic(nj.Module):
     self.enable_obs_actor_loss = config.enable_obs_actor_loss
     self.enable_bc = config.enable_bc
     self.random_behavior = behaviors.Random(None, act_space, config, name='random_behavior')
+    self.cql_log_alpha = nj.Variable(jnp.zeros, (), name='cql_log_alpha') if self.config.with_lagrange else None
 
   def sample_dict_array(self, d: dict, n: int):
     '''
@@ -420,7 +421,7 @@ class ImagActorCritic(nj.Module):
 
     # 状態価値関数の更新
     for key, critic in self.critics.items():
-      mets = critic.train(traj, self.actor)
+      mets = critic.train(traj, self.actor, self.cql_log_alpha)
       metrics.update({f'{key}_critic_{k}': v for k, v in mets.items()})
     return traj, metrics
 
@@ -453,7 +454,6 @@ class ImagActorCritic(nj.Module):
     metrics = {}
     advs = []
     total = sum(self.scales[k] for k in self.critics)
-    # traj = {k: jnp.concatenate([img_traj[k], obs_traj[k]], axis=1) for k in img_traj.keys()}
     obs_traj, img_traj = traj_dict['obs_traj'], traj_dict['img_traj']
     traj = interp(obs_traj, img_traj, f=self.config.loss_scales.conservative_f)
     print(f'traj_shape: {next(iter((traj.values()))).shape}')
@@ -484,21 +484,35 @@ class ImagActorCritic(nj.Module):
       ran_prob = jnp.ones(random_traj['action'][:-1].shape[:-1]) * 0.5
       ran_log_prob = jnp.log(ran_prob**random_traj['action'].shape[-1])
       ran_log_prob *= sg(random_traj['weight'])[:-1]
-      print(f'img_log_prob.shape: {img_log_prob.shape}')
-      print(f'ran_log_prob.shape: {ran_log_prob.shape}')
+
+      if self.config.negative_img_log_prob:
+        img_log_prob = -img_log_prob
+        ran_log_prob = -ran_log_prob
+
       img_ran_log_prob_diff = img_log_prob - ran_log_prob
       img_log_prob = jnp.stack([img_log_prob, ran_log_prob], axis=-1)
-      img_log_prob = jax.nn.logsumexp(img_log_prob / self.config.logsumexp_temp, axis=-1)
+      img_log_prob = jax.nn.logsumexp(img_log_prob / self.config.logsumexp_temp, axis=-1) * self.config.logsumexp_temp
+
     obs_log_prob = self.actor(sg(obs_traj)).log_prob(sg(obs_traj['action']))[:-1]
     obs_log_prob *= sg(obs_traj['weight'])[:-1]
-    log_prob_term = img_log_prob - obs_log_prob
-    log_prob_term *= self.config.loss_scales.conservative
+
+    log_prob_term = img_log_prob
+    if self.config.add_negative_obs_log_prob:
+      log_prob_term += -obs_log_prob
+    
+    if self.config.with_lagrange:
+      cql_alpha = jax.lax.clamp(0.0, jnp.exp(self.cql_log_alpha.read()), 1e6)
+      log_prob_term = cql_alpha * (log_prob_term - self.config.lagrange_threshold)
+    else:
+      log_prob_term *= self.config.loss_scales.conservative
+
     loss += log_prob_term.mean()
 
     loss *= self.config.loss_scales.actor
     metrics.update(self._metrics(traj, policy, logpi, ent, adv))
     metrics.update(jaxutils.tensorstats(img_log_prob, 'img_log_prob'))
     metrics.update(jaxutils.tensorstats(obs_log_prob, 'obs_log_prob'))
+    metrics.update(jaxutils.tensorstats(log_prob_term, 'log_prob_term'))
     if self.config.combo_random_policy:
       metrics.update(jaxutils.tensorstats(ran_log_prob, 'ran_log_prob'))
       metrics.update(jaxutils.tensorstats(img_ran_log_prob_diff, 'img_ran_log_prob_diff'))
@@ -534,15 +548,12 @@ class VFunction(nj.Module):
     self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
     if self.config.with_lagrange:
       self.lagrange_opt = jaxutils.Optimizer(name='lagrange_opt', **self.config.lagrange_opt)
-      # with jax.transfer_guard("allow"):
-      #   self.cql_log_alpha = jax.device_put(jnp.zeros(1), device=jax.devices("gpu")[0])
-      self.cql_log_alpha = nj.Variable(jnp.zeros, (), name='cql_log_alpha')
 
-  def train(self, traj, actor):
+  def train(self, traj, actor, cql_log_alpha):
     if self.config.enable_combo:
       assert isinstance(traj, dict), f'the type of traj is invalid: {type(traj)}'
       target = {k: sg(self.score(v)[1]) for k, v in traj.items()}
-      mets, metrics = self.opt(self.net, self.conservative_loss, traj, target, has_aux=True)
+      mets, metrics = self.opt(self.net, self.conservative_loss, traj, target, cql_log_alpha, has_aux=True)
     else:
       target = sg(self.score(traj)[1])
       mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
@@ -550,24 +561,30 @@ class VFunction(nj.Module):
     self.updater()
     return metrics
   
+  def rew_std_gen(self, dist, target, metrics=None):
+    if metrics is None:
+      metrics={}
+    dist_std = sg(dist.std())
+    standardized_dist_std = (dist_std - dist_std.mean(axis=-1, keepdims=True)) / (dist_std.std(axis=-1, keepdims=True) + 1e-8)
+    metrics.update(jaxutils.tensorstats(dist_std, 'dist_std'))
+    metrics.update(jaxutils.tensorstats(standardized_dist_std, 'standardized_dist_std'))
+    if self.config.rew_std_gen_sigmoid:
+      target *= 1 / (1 + jnp.exp(standardized_dist_std)) # stdが大きいほど価値を小さく見積もる
+    elif self.config.rew_std_gen_relu:
+      target *= -jax.nn.relu(standardized_dist_std) + 1.0 # stdが大きいほど価値を小さく見積もる
+    elif self.config.rew_std_gen_200:
+      target -= 200 / (1 + jnp.exp(-standardized_dist_std)) # stdが大きいほど価値を小さく見積もる
+    else:
+      raise NotImplementedError()
+    return target, metrics
+  
   def loss(self, traj, target):
     metrics = {}
     traj = {k: v[:-1] for k, v in traj.items()}
     dist = self.net(traj)
     metrics = jaxutils.tensorstats(dist.mean())
     if self.config.enable_rew_std_gen:
-      dist_std = sg(dist.std())
-      standardized_dist_std = (dist_std - dist_std.mean(axis=-1, keepdims=True)) / (dist_std.std(axis=-1, keepdims=True) + 1e-8)
-      metrics.update(jaxutils.tensorstats(dist_std, 'dist_std'))
-      metrics.update(jaxutils.tensorstats(standardized_dist_std, 'standardized_dist_std'))
-      if self.config.rew_std_gen_sigmoid:
-        target *= 1 / (1 + jnp.exp(standardized_dist_std)) # stdが大きいほど価値を小さく見積もる
-      elif self.config.rew_std_gen_relu:
-        target *= -jax.nn.relu(standardized_dist_std) + 1.0 # stdが大きいほど価値を小さく見積もる
-      elif self.config.rew_std_gen_200:
-        target -= 200 / (1 + jnp.exp(-standardized_dist_std)) # stdが大きいほど価値を小さく見積もる
-      else:
-        raise NotImplementedError()
+      target, metrics = self.rew_std_gen(dist, target, metrics)
     loss = -dist.log_prob(sg(target))
     
     if self.config.critic_slowreg == 'logprob':
@@ -608,7 +625,7 @@ class VFunction(nj.Module):
 
   #   return swap(samples)
   
-  def conservative_loss(self, traj, target):
+  def conservative_loss(self, traj, target, cql_log_alpha):
     # V関数の損失
     metrics = {}
     traj = {key: {k: v[:-1] for k, v in trajectory.items()} for key, trajectory in traj.items()}
@@ -618,9 +635,6 @@ class VFunction(nj.Module):
     if self.config.combo_random_policy:
       random_traj = traj["random_traj"]
 
-    print(f'img_traj_shape: {list(traj["img_traj"].values())[0].shape}')
-    print(f'obs_traj_shape: {list(traj["obs_traj"].values())[0].shape}')
-
     img_traj['target'] = target["img_traj"]
     obs_traj['target'] = target["obs_traj"]
 
@@ -628,6 +642,8 @@ class VFunction(nj.Module):
     target = traj['target']
 
     dist = self.net(traj)
+    if self.config.enable_rew_std_gen:
+      target, metrics = self.rew_std_gen(dist, target, metrics)
     loss = -dist.log_prob(sg(target))
     
     if self.config.critic_slowreg == 'logprob':
@@ -649,19 +665,19 @@ class VFunction(nj.Module):
     if self.config.combo_random_policy:
       expected_V_ran = self.net(random_traj).mean() * sg(random_traj['weight'])
       expected_V_img = jnp.stack([expected_V_img, expected_V_ran], axis=-1)
-      expected_V_img = jax.nn.logsumexp(expected_V_img / self.config.logsumexp_temp, axis=-1)
+      expected_V_img = jax.nn.logsumexp(expected_V_img / self.config.logsumexp_temp, axis=-1) * self.config.logsumexp_temp
     expected_V_img, expected_V_obs = expected_V_img.mean(), expected_V_obs.mean()
     conservative_loss = expected_V_img - expected_V_obs
 
     if self.config.with_lagrange:
       def lagrange_loss(conservative_loss):
-        cql_alpha = jax.lax.clamp(0.0, jnp.exp(self.cql_log_alpha.read()), 1e6)
+        cql_alpha = jax.lax.clamp(0.0, jnp.exp(cql_log_alpha.read()), 1e6)
         conservative_loss = cql_alpha * (conservative_loss - self.config.lagrange_threshold)
         cql_alpha_loss = -conservative_loss
         return cql_alpha_loss, conservative_loss
-      lagrange_metrics, conservative_loss = self.lagrange_opt(self.cql_log_alpha, lagrange_loss, conservative_loss, has_aux=True)
-
-    conservative_loss *= self.config.loss_scales.conservative
+      lagrange_metrics, conservative_loss = self.lagrange_opt(cql_log_alpha, lagrange_loss, conservative_loss, has_aux=True)
+    else:
+      conservative_loss *= self.config.loss_scales.conservative
     loss += conservative_loss
 
     loss *= self.config.loss_scales.critic
@@ -672,7 +688,7 @@ class VFunction(nj.Module):
     if self.config.combo_random_policy:
       metrics.update(jaxutils.tensorstats(expected_V_ran, 'expected_V_ran'))
     if self.config.with_lagrange:
-      metrics.update(jaxutils.tensorstats(self.cql_log_alpha.read(), 'cql_log_alpha'))
+      metrics.update(jaxutils.tensorstats(cql_log_alpha.read(), 'cql_log_alpha'))
       metrics.update(lagrange_metrics)
     return loss, metrics
 
