@@ -48,12 +48,14 @@ class Driver:
 
   def _step(self, policy, step, episode):
     assert all(len(x) == len(self._env) for x in self._acts.values())
+    # print('self._acts', self._acts)
     acts = {k: v for k, v in self._acts.items() if not k.startswith('log_')}
     obs = self._env.step(acts)
     obs = {k: convert(v) for k, v in obs.items()}
     assert all(len(x) == len(self._env) for x in obs.values()), obs
+    # print('acts 1', acts)
     acts, self._state = policy(obs, self._state, **self._kwargs)
-    
+    # print('acts 2', acts, self._state)
     acts = {k: convert(v) for k, v in acts.items()}
     if obs['is_last'].any():
       mask = 1 - obs['is_last']

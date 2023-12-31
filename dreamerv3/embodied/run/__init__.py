@@ -3,6 +3,8 @@ from .parallel import parallel
 from .train import train
 from .pretrain import pretrain
 from .train_on_dataset import train_on_dataset
+from .train_simple_agent import train_simple_agent
+from .eval_only_simple_agent import eval_only_simple_agent
 from .train_eval import train_eval
 from .train_holdout import train_holdout
 from .train_save import train_save

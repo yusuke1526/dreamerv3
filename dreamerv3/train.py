@@ -63,6 +63,13 @@ def main(argv=None):
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
       embodied.run.train_on_dataset(agent, env, replay, logger, args)
 
+    elif args.script == 'train_simple_agent':
+      replay = make_replay(config, config.replaydir)
+      env = make_envs(config)
+      cleanup.append(env)
+      agent = agt.SimpleAgent(env.obs_space, env.act_space, step, config)
+      embodied.run.train_simple_agent(agent, env, replay, logger, args)
+
     elif args.script == 'train_save':
       replay = make_replay(config, logdir / 'replay')
       env = make_envs(config)
@@ -99,6 +106,12 @@ def main(argv=None):
       cleanup.append(env)
       agent = agt.Agent(env.obs_space, env.act_space, step, config)
       embodied.run.eval_only(agent, env, logger, args)
+
+    elif args.script == 'eval_only_simple_agent':
+      env = make_envs(config, mode='eval')  # mode='eval'
+      cleanup.append(env)
+      agent = agt.SimpleAgent(env.obs_space, env.act_space, step, config)
+      embodied.run.eval_only_simple_agent(agent, env, logger, args)
 
     elif args.script == 'parallel':
       assert config.run.actor_batch <= config.envs.amount, (

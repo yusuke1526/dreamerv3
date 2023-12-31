@@ -219,7 +219,8 @@ class WorldModel(nj.Module):
       out = out if isinstance(out, dict) else {name: out}
       dists.update(out)
     losses = {}
-    losses['dyn'] = self.rssm.dyn_loss(post, prior, **self.config.dyn_loss)
+    if not self.config.disable_dyn_loss:
+      losses['dyn'] = self.rssm.dyn_loss(post, prior, **self.config.dyn_loss)
     losses['rep'] = self.rssm.rep_loss(post, prior, **self.config.rep_loss)
     for key, dist in dists.items():
       loss = -dist.log_prob(data[key].astype(jnp.float32))
@@ -289,9 +290,9 @@ class WorldModel(nj.Module):
     context, _ = self.rssm.observe(
         self.encoder(data)[:6], data['action'][:6],
         data['is_first'][:6])
-    print(f'context.keys(): {context.keys()}')
+    # print(f'context.keys(): {context.keys()}')
     context.update({k: v[:6] for k, v in data.items() if k not in set(context.keys())})
-    print(f'context.keys(): {context.keys()}')
+    # print(f'context.keys(): {context.keys()}')
     start = {k: v[:, 4] for k, v in context.items()}
     recon = self.heads['decoder'](context)
     traj = self.imagine(policy, start, self.config.imag_horizon)
@@ -456,7 +457,7 @@ class ImagActorCritic(nj.Module):
     total = sum(self.scales[k] for k in self.critics)
     obs_traj, img_traj = traj_dict['obs_traj'], traj_dict['img_traj']
     traj = interp(obs_traj, img_traj, f=self.config.loss_scales.conservative_f)
-    print(f'traj_shape: {next(iter((traj.values()))).shape}')
+    # print(f'traj_shape: {next(iter((traj.values()))).shape}')
     for key, critic in self.critics.items():
       rew, ret, base = critic.score(traj, self.actor)
       offset, invscale = self.retnorms[key](ret)
@@ -769,3 +770,135 @@ def interp(a: dict, b: dict, f=0.5):
     samples[k] = jnp.where(choices_broadcasted, a[k], b[k])
 
   return swap(samples)
+
+
+# for simple BC
+
+@jaxagent.SimpleWrapper
+class SimpleAgent(nj.Module):
+  '''agent without world model'''
+
+  configs = yaml.YAML(typ='safe').load(
+      (embodied.Path(__file__).parent / 'configs.yaml').read())
+
+  def __init__(self, obs_space, act_space, step, config):
+    self.config = config
+    self.obs_space = obs_space
+    self.act_space = act_space['action']
+    self.step = step
+    self.inner_agent = InnerAgent(obs_space, act_space, config, name='inner_agent')
+
+  def policy(self, obs, state, mode='train'):
+    self.config.jax.jit and print('Tracing policy function.')
+    obs = self.preprocess(obs)
+    outs = self.inner_agent.policy(obs)
+    if mode == 'eval':
+      outs['action'] = outs['action'].sample(seed=nj.rng())
+      outs['log_entropy'] = jnp.zeros(outs['action'].shape[:1])
+    elif mode == 'explore':
+      outs['log_entropy'] = outs['action'].entropy()
+      outs['action'] = outs['action'].sample(seed=nj.rng())
+    elif mode == 'train':
+      outs['log_entropy'] = outs['action'].entropy()
+      outs['action'] = outs['action'].sample(seed=nj.rng())
+    return outs
+
+  def train(self, data, state):
+    self.config.jax.jit and print('Tracing train function.')
+    metrics = {}
+    data = self.preprocess(data)
+    outs, mets = self.inner_agent.train(data)
+    metrics.update(mets)
+    outs = {}
+    return outs, state, metrics
+  
+  def report(self, data):
+    self.config.jax.jit and print('Tracing report function.')
+    data = self.preprocess(data)
+
+    report = {}
+    report.update(self.inner_agent.report(data))
+
+    return report
+
+  def preprocess(self, obs):
+    obs = obs.copy()
+    for key, value in obs.items():
+      if key.startswith('log_') or key in ('key',):
+        continue
+      if len(value.shape) > 3 and value.dtype == jnp.uint8:
+        value = jaxutils.cast_to_compute(value) / 255.0
+      else:
+        value = value.astype(jnp.float32)
+      obs[key] = value
+    obs['cont'] = 1.0 - obs['is_terminal'].astype(jnp.float32)
+    return obs
+  
+class InnerAgent(nj.Module):
+
+  def __init__(self, obs_space, act_space, config):
+    self.obs_space = obs_space
+    self.act_space = act_space['action']
+    self.config = config
+    shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
+    shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
+    self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
+    self.linear = nets.Linear(**config.linear, name='lin')
+    self.heads = {
+        'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
+        # 'reward': nets.MLP((), **config.reward_head, name='rew'),
+        # 'cont': nets.MLP((), **config.cont_head, name='cont')
+    }
+    disc = self.act_space.discrete
+    self.actor = nets.MLP(
+        name='actor', dims='tensor', shape=self.act_space.shape, **config.simple_actor,
+        dist=config.actor_dist_disc if disc else config.actor_dist_cont)
+    self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
+    scales = self.config.loss_scales.copy()
+    image, vector = scales.pop('image'), scales.pop('vector')
+    scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
+    scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
+    self.scales = scales
+
+  def train(self, data):
+    # modules = [self.encoder, self.linear, *self.heads.values(), self.actor]
+    modules = [self.encoder, self.linear, self.actor]
+    mets, (outs, metrics) = self.opt(
+        modules, self.loss, data, has_aux=True)
+    metrics.update(mets)
+    return outs, metrics
+  
+  def loss(self, data):
+    out = self.policy(data)
+    predicted_actions = out['action'].sample(seed=nj.rng())
+    model_loss = jnp.square(predicted_actions - data['action'])
+    metrics = self._metrics(data, model_loss)
+    return model_loss.mean(), (out, metrics)
+  
+  def policy(self, data):
+    outs = {}
+    embed = self.encoder(data)
+    latent = self.linear(embed)
+    outs['action'] = self.actor(latent)
+    return outs
+  
+  def observe(self, embed, action, is_first, context, state=None):
+    swap = lambda x: {k: v.transpose([1, 0] + list(range(2, len(v.shape)))) for k, v in x.items()}
+    post, _ = self.rssm.observe(embed, action, is_first, state)
+    obs_traj = {'action': action, **post}
+    obs_traj['cont'] = (1.0 - context['is_terminal']).astype(jnp.float32)
+    discount = 1 - 1 / self.config.horizon
+    obs_traj['weight'] = jnp.cumprod(discount * obs_traj['cont'], 0) / discount
+    return swap(obs_traj)
+
+  def report(self, data):
+    report = {}
+    report.update(self.loss(data)[-1][-1])
+    return report
+
+  def _metrics(self, data, model_loss):
+    metrics = {}
+    metrics['model_loss_mean'] = model_loss.mean()
+    metrics['model_loss_std'] = model_loss.std()
+    metrics['reward_max_data'] = jnp.abs(data['reward']).max()
+    return metrics
