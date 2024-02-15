@@ -61,6 +61,13 @@ def train(agent, env, replay, logger, args):
   driver.on_step(lambda tran, _: step.increment())
   driver.on_step(replay.add)
 
+  def step_fn(tran, worker):
+    logger.add({k: v for k, v in tran.items() if '_reward' in k}, prefix='step')
+    logger.add({k: v for k, v in tran.items() if 'location' in k}, prefix='step')
+    logger.add({k: v for k, v in tran.items() if 'velocity' in k}, prefix='step')
+    logger.write(fps=True)
+  driver.on_step(step_fn)
+
   print('Prefill train dataset.')
   random_agent = embodied.RandomAgent(env.act_space)
   while len(replay) < max(args.batch_steps, args.train_fill):

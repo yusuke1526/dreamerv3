@@ -26,8 +26,11 @@ def eval_only(agent, env, logger, args):
   def per_episode(ep):
     length = len(ep['reward']) - 1
     score = float(ep['reward'].astype(np.float64).sum())
-    logger.add({'length': length, 'score': score}, prefix='episode')
+    # reward terms
+    reward_terms = {k: v for k, v in ep.items() if '_reward' in k}
+    logger.add({'length': length, 'score': score, **reward_terms}, prefix='episode')
     print(f'Episode has {length} steps and return {score:.1f}.')
+    # print('eval_only 33', reward_terms.keys())
     stats = {}
     for key in args.log_keys_video:
       if key in ep:
@@ -42,11 +45,29 @@ def eval_only(agent, env, logger, args):
         stats[f'mean_{key}'] = ep[key].mean()
       if re.match(args.log_keys_max, key):
         stats[f'max_{key}'] = ep[key].max(0).mean()
+
+    for key, value in reward_terms.items():
+      if not args.log_zeros and key not in nonzeros and (value == 0).all():
+        continue
+      nonzeros.add(key)
+      stats[f'sum_{key}'] = reward_terms[key].sum()
+      stats[f'mean_{key}'] = reward_terms[key].mean()
+      stats[f'max_{key}'] = reward_terms[key].max(0).mean()
+      stats[f'min_{key}'] = reward_terms[key].min(0).mean()
+      stats[f'std_{key}'] = reward_terms[key].std()
+      
     metrics.add(stats, prefix='stats')
 
   driver = embodied.Driver(env)
   driver.on_episode(lambda ep, worker: per_episode(ep))
   driver.on_step(lambda tran, _: step.increment())
+
+  def step_fn(tran, worker):
+    logger.add({k: v for k, v in tran.items() if '_reward' in k}, prefix='step')
+    logger.add({k: v for k, v in tran.items() if 'location' in k}, prefix='step')
+    logger.add({k: v for k, v in tran.items() if 'velocity' in k}, prefix='step')
+    logger.write(fps=True)
+  driver.on_step(step_fn)
 
   checkpoint = embodied.Checkpoint()
   checkpoint.agent = agent

@@ -37,6 +37,7 @@ class Driver:
 
   def on_step_pop(self):
     self._on_steps.pop()
+    # print(f'popped on steps')
 
   def on_episode(self, callback):
     self._on_episodes.append(callback)
@@ -69,12 +70,12 @@ class Driver:
       trns = {**obs, **acts, **latent}
     else:
       trns = {**obs, **acts}
-
     # trnsのkeyが変化しない様にする
     if len(self._trns_keys) == 0:
       self._trns_keys = list(trns.keys())
-    else:
-      trns = {k: trns[k] for k in self._trns_keys}
+    # else:
+    #   trns = {k: v for k, v in trns.items() if k in self._trns_keys}
+    #   trns_others = {k: v for k, v in trns.items() if k not in self._trns_keys}
     
     if obs['is_first'].any():
       for i, first in enumerate(obs['is_first']):
@@ -82,7 +83,10 @@ class Driver:
           self._eps[i].clear()
     for i in range(len(self._env)):
       trn = {k: v[i] for k, v in trns.items()}
+      trn = {k: v for k, v in trn.items() if k in self._trns_keys}
+      trn_others = {k: v for k, v in trn.items() if k not in self._trns_keys}
       [self._eps[i][k].append(v) for k, v in trn.items()]
+      trn.update(trn_others)
       [fn(trn, i, **self._kwargs) for fn in self._on_steps]
       step += 1
     if obs['is_last'].any():

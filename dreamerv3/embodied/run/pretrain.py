@@ -71,14 +71,20 @@ def pretrain(agent, env, replay, logger, args):
 #   else:
 #     print('use RandomAgent for Prefill train dataset')
 #     collect_agent = embodied.RandomAgent(env.act_space)
+  
+  def step_fn(tran, worker):
+    logger.add({k: v for k, v in tran.items() if '_reward' in k}, prefix='collect_step')
+    logger.add({k: v for k, v in tran.items() if 'location' in k}, prefix='collect_step')
+    logger.add({k: v for k, v in tran.items() if 'velocity' in k}, prefix='collect_step')
+    logger.write(fps=True)
+  driver.on_step(step_fn)
+
   while len(replay) < max(args.batch_steps, args.train_fill):
     driver(collect_agent.policy, steps=100)
   logger.add(metrics.result())
   logger.write()
-  print(driver._on_steps)
-  driver.on_step_pop()
-  print(driver._on_steps)
-  print(f'popped on steps')
+  driver.on_step_pop() #step_fn
+  driver.on_step_pop() #replay.add
 
   dataset = agent.dataset(replay.dataset)
   state = [None]  # To be writable from train step function below.
